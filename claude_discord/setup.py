@@ -146,6 +146,7 @@ async def setup_bridge(
     from .cogs.scheduler import SchedulerCog
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
+    from .cogs.tmux_sync import TmuxSyncCog
     from .database.ask_repo import PendingAskRepository
     from .database.inbox_repo import ThreadInboxRepository
     from .database.lounge_repo import LoungeRepository
@@ -318,6 +319,30 @@ async def setup_bridge(
     await bot.add_cog(context_links_cog)
     if context_links_cog._config is not None:
         logger.info("Registered ContextLinksCog (config=%s)", context_links_config)
+
+    # --- TmuxSyncCog (per-thread opt-in via /tmux-sync on) ---
+    # Always registered — sync is off for every thread by default and only
+    # activates when a user explicitly runs the slash command. Requires a
+    # readable CLI sessions directory; silently skips otherwise.
+    from pathlib import Path as _Path
+
+    _tmux_sync_dir_str = (
+        cli_sessions_path
+        or os.getenv("CLI_SESSIONS_PATH")
+        or str(_Path.home() / ".claude" / "projects")
+    )
+    _tmux_sync_dir = _Path(_tmux_sync_dir_str).expanduser()
+    if _tmux_sync_dir.is_dir():
+        tmux_sync_cog = TmuxSyncCog(
+            bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
+            session_repo=session_repo,
+            settings_repo=settings_repo,
+            cli_sessions_path=_tmux_sync_dir,
+        )
+        await bot.add_cog(tmux_sync_cog)
+        logger.info("Registered TmuxSyncCog (cli_sessions_path=%s)", _tmux_sync_dir)
+    else:
+        logger.info("TmuxSyncCog skipped — CLI sessions dir not found: %s", _tmux_sync_dir)
 
     components = BridgeComponents(
         session_repo=session_repo,

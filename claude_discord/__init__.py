@@ -20,6 +20,7 @@ from .cogs.run_config import RunConfig
 from .cogs.scheduler import SchedulerCog
 from .cogs.session_manage import SessionManageCog
 from .cogs.skill_command import SkillCommandCog
+from .cogs.tmux_sync import TmuxSyncCog
 from .cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 from .concurrency import ActiveSession, SessionRegistry
 from .database.notification_repo import NotificationRepository
@@ -50,6 +51,7 @@ __all__ = [
     "SessionRegistry",
     "SessionManageCog",
     "SkillCommandCog",
+    "TmuxSyncCog",
     "SessionRepository",
     "SettingsRepository",
     # Session Sync
