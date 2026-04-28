@@ -176,7 +176,14 @@ class TmuxSyncCog(commands.Cog):
 
     async def _initial_scan(self) -> None:
         records = await self.session_repo.list_all(limit=200)
+        # list_all returns DESC by last_used_at, so the first time we see a
+        # session_id corresponds to its most-recently-used thread. Skip later
+        # duplicates (e.g. /resume creates a 2nd thread on the same session).
+        seen_sessions: set[str] = set()
         for rec in records:
+            if rec.session_id in seen_sessions:
+                continue
+            seen_sessions.add(rec.session_id)
             await self._watch(rec.session_id, rec.thread_id)
         logger.info("TmuxSyncCog tracking %d sessions (sync state per-thread)", len(self._watched))
 
@@ -185,13 +192,18 @@ class TmuxSyncCog(commands.Cog):
         return hits[0] if hits else None
 
     async def _watch(self, session_id: str, thread_id: int) -> _SessionState | None:
-        """Add a session to the watch set with baseline=current-EOF.
+        """Add a session's watch state with baseline=current-EOF.
+
+        Passive — if the session is already watched, returns the existing
+        state untouched. Callers that need to switch which thread receives
+        mirrored output for a session should use ``_rebind_thread()``.
 
         Always baselines the JSONL (records existing uuids, offset = file size)
         so that history is never re-posted, even when sync is later flipped on.
         """
-        if session_id in self._watched:
-            return self._watched[session_id]
+        existing = self._watched.get(session_id)
+        if existing is not None:
+            return existing
         path = self._find_jsonl(session_id)
         if path is None:
             return None
@@ -216,6 +228,31 @@ class TmuxSyncCog(commands.Cog):
 
         state.enabled = await self._is_enabled(thread_id)
         self._watched[session_id] = state
+        return state
+
+    async def _rebind_thread(self, session_id: str, thread_id: int) -> _SessionState | None:
+        """Explicitly point a watched session at a different thread.
+
+        Called from the slash command path when a user runs ``/tmux-sync on``
+        in a thread that already shares its session_id with another thread
+        (e.g. the same session was opened in multiple threads via ``/resume``).
+        The user's most recent action wins — future mirrored output goes to
+        the thread they're currently in.
+
+        If the session has not yet been watched, falls through to ``_watch``
+        which creates the initial state with the requested thread_id.
+        """
+        state = self._watched.get(session_id)
+        if state is None:
+            return await self._watch(session_id, thread_id)
+        if state.thread_id != thread_id:
+            logger.info(
+                "TmuxSyncCog rebinding session %s from thread %d to %d",
+                session_id[:8],
+                state.thread_id,
+                thread_id,
+            )
+            state.thread_id = thread_id
         return state
 
     async def _is_enabled(self, thread_id: int) -> bool:
@@ -282,10 +319,12 @@ class TmuxSyncCog(commands.Cog):
             return
 
         await self.settings_repo.set(_setting_key(thread_id), "on")
-        # Re-baseline current state so we don't dump pre-existing history.
-        state = await self._watch(rec.session_id, thread_id)
+        # Bind/rebind the watch state to THIS thread so future mirrors route
+        # correctly even if another thread previously claimed this session_id.
+        state = await self._rebind_thread(rec.session_id, thread_id)
         if state is not None:
             state.enabled = True
+            # Re-baseline so we don't dump pre-existing history.
             with contextlib.suppress(OSError):
                 state.offset = state.jsonl_path.stat().st_size
             state.in_sync_cycle = None  # will resolve on next user turn

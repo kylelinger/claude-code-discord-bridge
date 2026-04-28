@@ -270,6 +270,152 @@ async def test_disabled_thread_not_mirrored_but_offset_advances(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_watch_is_passive_first_call_wins(tmp_path: Path):
+    """_watch is the passive baseline path. First call wins; subsequent calls
+    return the existing state untouched. Active rebinds use _rebind_thread.
+    """
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, _, _ = _make_cog(tmp_path)
+    state_a = await cog._watch(sid, thread_id=111)
+    assert state_a is not None
+    assert state_a.thread_id == 111
+
+    # Second _watch must NOT overwrite (e.g. initial_scan iterating older rows
+    # of the same session_id should not clobber the more-recent thread).
+    state_b = await cog._watch(sid, thread_id=222)
+    assert state_b is state_a
+    assert state_b.thread_id == 111  # untouched
+
+
+@pytest.mark.asyncio
+async def test_rebind_thread_changes_active_thread(tmp_path: Path):
+    """_rebind_thread is the explicit path used by /tmux-sync on."""
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, _, _ = _make_cog(tmp_path)
+    state = await cog._watch(sid, thread_id=111)
+    assert state is not None and state.thread_id == 111
+
+    rebound = await cog._rebind_thread(sid, thread_id=222)
+    assert rebound is state
+    assert rebound.thread_id == 222
+
+
+@pytest.mark.asyncio
+async def test_rebind_thread_creates_state_when_unwatched(tmp_path: Path):
+    """If the session is brand new, _rebind_thread should fall through to _watch."""
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, _, _ = _make_cog(tmp_path)
+    state = await cog._rebind_thread(sid, thread_id=111)
+    assert state is not None
+    assert state.thread_id == 111
+    assert sid in cog._watched
+
+
+@pytest.mark.asyncio
+async def test_initial_scan_dedupes_by_session_id_keeping_most_recent(tmp_path: Path):
+    """When SessionRepository contains two rows with the same session_id (e.g.
+    /resume created a fresh thread on an existing session), initial_scan must
+    bind the watch to the most-recently-used thread. list_all returns DESC by
+    last_used_at, so the FIRST row wins.
+    """
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, session_repo, _ = _make_cog(tmp_path)
+    # Newest first (DESC by last_used_at): NEW thread row, then OLD thread row
+    session_repo.list_all = AsyncMock(
+        return_value=[
+            MagicMock(session_id=sid, thread_id=222),  # most recent
+            MagicMock(session_id=sid, thread_id=111),  # older
+        ]
+    )
+    await cog._initial_scan()
+    state = cog._watched[sid]
+    assert state.thread_id == 222  # most-recent thread, not 111
+
+
+@pytest.mark.asyncio
+async def test_cmd_on_rebinds_thread_id_for_existing_state(tmp_path: Path):
+    """If the cog already watched this session under an older thread (e.g. via
+    initial scan), running /tmux-sync on from a newer thread that shares the
+    same session_id must redirect future mirrors to the newer thread.
+    """
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, session_repo, _ = _make_cog(tmp_path)
+
+    # Pre-seed state with the OLD thread (as initial_scan would do)
+    await cog._watch(sid, thread_id=111)
+
+    # User runs /tmux-sync on from the NEW thread
+    session_repo.get = AsyncMock(return_value=MagicMock(session_id=sid, thread_id=222))
+    interaction = MagicMock()
+    interaction.channel_id = 222
+    interaction.response.send_message = AsyncMock()
+    await cog.cmd_on.callback(cog, interaction)
+
+    state = cog._watched[sid]
+    assert state.thread_id == 222
+    assert state.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_mirror_routes_to_rebound_thread_after_resume(tmp_path: Path):
+    """End-to-end: after rebinding, a tmux turn must hit the new thread, not the old one."""
+    sid = "abc-123"
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.touch()
+
+    cog, session_repo, _ = _make_cog(tmp_path)
+
+    # Old thread first
+    await cog._watch(sid, thread_id=111)
+
+    # Rebind via cmd_on from new thread
+    session_repo.get = AsyncMock(return_value=MagicMock(session_id=sid, thread_id=222))
+    interaction = MagicMock()
+    interaction.channel_id = 222
+    interaction.response.send_message = AsyncMock()
+    await cog.cmd_on.callback(cog, interaction)
+
+    # Append a tmux turn
+    _write_jsonl_lines(
+        jsonl,
+        [_user_turn("u_new", "from tmux"), _assist_turn("a_new", "claude reply")],
+    )
+    await cog._drain_session(cog._watched[sid])
+
+    # bot.get_channel must have been called with the NEW thread id (222)
+    called_ids = [c.args[0] for c in cog.bot.get_channel.call_args_list]
+    assert 222 in called_ids
+    assert 111 not in called_ids
+
+
+@pytest.mark.asyncio
 async def test_dedup_window_evicts_stale_entries(tmp_path: Path):
     cog, _, _ = _make_cog(tmp_path)
     cog._record_discord_msg(thread_id=1, content="hello")
